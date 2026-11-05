@@ -24,4 +24,5 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = ["e2e: runs against a deployed server, needs A2A_E2E_URL"]
