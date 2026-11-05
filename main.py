@@ -1,5 +1,8 @@
 import json
 import os
+import re
+import time
+import uuid
 from collections import OrderedDict
 
 import uvicorn
@@ -8,14 +11,32 @@ from a2a.server.apps import A2AStarletteApplication
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
-from a2a.types import AgentCapabilities, AgentCard, AgentSkill, UnsupportedOperationError
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+    InternalError,
+    UnsupportedOperationError,
+)
 from a2a.utils import new_agent_text_message
 from a2a.utils.errors import ServerError
 from dotenv import load_dotenv
 from loguru import logger
+from openai import OpenAIError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from liftline import (
+    CURRENT_REQUEST,
+    ConfigurationUnavailableError,
+    KnowledgeUnavailableError,
+    ModelResponseError,
+    RequestObservability,
+    evaluate_request,
+    extract_request,
+    load_skill_bundle,
+)
 
 load_dotenv()
 
@@ -30,15 +51,13 @@ DEFAULT_PORT = 2009
 PROTOCOL_VERSION = "0.3.0"
 MAX_CONTEXTS = 1000
 MAX_REMEMBERED_MESSAGES = 50
-DEFAULT_NAME = "Bootcamp Echo Agent"
+DEFAULT_NAME = "LiftLine Dispatch Advisor"
 DEFAULT_DESCRIPTION = (
-    "Generic conversational agent for the A2A bootcamp lab. It greets you, explains what it "
-    "can do, and replies to every message while remembering the conversation."
+    "Evaluate fictional LiftLine delivery from Zava Regional depot to Riverside: loaded capacity, "
+    "site forklift requirements, arrival slots, and EUR quotes. Uses a bundled dispatch Skill "
+    "with synthetic data. Use after Zava identifies an eligible origin. Does not own Zava stock "
+    "or approval rules and cannot book."
 )
-GREETING_WORDS = {"hi", "hello", "hey", "hallo", "hoi"}
-HELP_PHRASES = ("help", "what can you do", "who are you", "what are you")
-HIDDEN_HEADERS = {"authorization", "cookie"}
-
 conversations: OrderedDict[str, list[str]] = OrderedDict()
 
 
@@ -58,35 +77,62 @@ def public_url() -> str:
     return base.rstrip("/") + "/"
 
 
-def respond(history: list[str], text: str) -> str:
-    message = text.strip()
-    if not message:
-        return "I didn't receive any text. Send me a message and I'll reply."
-    lowered = message.lower()
-    if any(phrase in lowered for phrase in HELP_PHRASES):
-        return (
-            f"I'm {agent_name()}, a generic A2A test agent. I greet you, remember the "
-            "conversation, and echo what you say. Try 'hello' or send me anything."
-        )
-    if lowered.split()[0].strip("!,.") in GREETING_WORDS:
-        return f"Hello! I'm {agent_name()}. Say 'help' to see what I can do."
-    count = min(len(history) + 1, MAX_REMEMBERED_MESSAGES)
-    noun = "message" if count == 1 else "messages"
-    return f'You said: "{message}". I now remember {count} {noun} from this conversation.'
-
-
 class ChatExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        context_id = context.context_id or ""
-        text = context.get_user_input()
-        history = conversations.setdefault(context_id, [])
-        conversations.move_to_end(context_id)
-        reply = respond(history, text)
-        history.append(text)
-        del history[:-MAX_REMEMBERED_MESSAGES]
-        while len(conversations) > MAX_CONTEXTS:
-            conversations.popitem(last=False)
-        logger.info(f"Replying in context {context_id} ({len(history)} remembered)")
+        text = context.get_user_input().strip()
+        context_id = context.context_id
+        history = conversations.get(context_id, []) if context_id else []
+        if context_id and context_id in conversations:
+            conversations.move_to_end(context_id)
+        request_info = CURRENT_REQUEST.get()
+        if request_info is None:
+            request_info = RequestObservability(
+                correlation_id=uuid.uuid4().hex,
+                capability="unknown",
+                started_at=time.perf_counter(),
+            )
+        try:
+            bundle = load_skill_bundle()
+            request_info.fixture_id = bundle.fixture.fixture_id
+            fields = await extract_request(bundle.skill_text, history, text)
+            result = evaluate_request(fields, bundle.fixture, text)
+            reply = result.text
+            request_info.result_status = result.status
+        except KnowledgeUnavailableError as error:
+            reply = (
+                f"status=unavailable\nRequired Skill/reference unavailable: {error}.\n"
+                "advisory_only=true"
+            )
+            request_info.result_status = "unavailable"
+        except ConfigurationUnavailableError:
+            logger.error(
+                f"LiftLine model authentication unavailable "
+                f"correlation_id={request_info.correlation_id}"
+            )
+            request_info.result_status = "unavailable"
+            raise ServerError(error=InternalError()) from None
+        except (OpenAIError, ModelResponseError) as error:
+            logger.error(
+                f"LiftLine model request failed correlation_id={request_info.correlation_id} "
+                f"error_type={type(error).__name__}"
+            )
+            request_info.result_status = "unavailable"
+            raise ServerError(error=InternalError()) from None
+        finally:
+            logger.info(
+                "dispatch_evaluation "
+                f"correlation_id={request_info.correlation_id} "
+                f"capability={request_info.capability} "
+                "skill_id=liftline-dispatch "
+                f"reference_id={request_info.fixture_id} "
+                f"result_status={request_info.result_status} "
+                f"elapsed_ms={(time.perf_counter() - request_info.started_at) * 1000:.1f}"
+            )
+            if context_id:
+                conversations[context_id] = [*history, text][-MAX_REMEMBERED_MESSAGES:]
+                conversations.move_to_end(context_id)
+                while len(conversations) > MAX_CONTEXTS:
+                    conversations.popitem(last=False)
         await event_queue.enqueue_event(
             new_agent_text_message(reply, context_id=context.context_id)
         )
@@ -113,7 +159,8 @@ class RequestLogMiddleware:
             chunks.append(message.get("body", b""))
             more_body = message.get("more_body", False)
         body = b"".join(chunks)
-        self.log_request(scope, body)
+        request_info = self.request_info(scope, body)
+        token = CURRENT_REQUEST.set(request_info)
 
         replayed = False
 
@@ -124,29 +171,53 @@ class RequestLogMiddleware:
                 return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
-        await self.app(scope, replay, send)
+        async def track_response(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                request_info.http_status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, replay, track_response)
+        except Exception:
+            request_info.result_status = "unavailable"
+            raise
+        finally:
+            logger.info(
+                "a2a_request "
+                f"correlation_id={request_info.correlation_id} "
+                f"capability={request_info.capability} "
+                f"result_status={request_info.result_status} "
+                f"http_status={request_info.http_status or 'unknown'} "
+                f"elapsed_ms={(time.perf_counter() - request_info.started_at) * 1000:.1f}"
+            )
+            CURRENT_REQUEST.reset(token)
 
     @staticmethod
-    def log_request(scope: Scope, body: bytes) -> None:
-        path = scope["path"]
-        headers = {
-            key.decode(): value.decode()
-            for key, value in scope["headers"]
-            if key.decode().lower() not in HIDDEN_HEADERS
-        }
-        logger.debug(f"POST {path} headers={headers} body={body.decode(errors='replace')}")
+    def request_info(scope: Scope, body: bytes) -> RequestObservability:
+        correlation_id = uuid.uuid4().hex
+        capability = "unknown"
         try:
             payload = json.loads(body)
-        except ValueError:
-            logger.warning(f"POST {path}: body is not valid JSON")
-            return
-        if not isinstance(payload, dict):
-            logger.warning(f"POST {path}: JSON-RPC body is not an object")
-            return
-        params = payload.get("params")
-        message = params.get("message") if isinstance(params, dict) else None
-        context_id = message.get("contextId") if isinstance(message, dict) else None
-        logger.info(f"POST {path} method={payload.get('method')} contextId={context_id}")
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            request_id = payload.get("id")
+            params = payload.get("params")
+            message = params.get("message") if isinstance(params, dict) else None
+            context_id = message.get("contextId") if isinstance(message, dict) else None
+            raw_id = request_id if request_id is not None else context_id
+            if isinstance(raw_id, (str, int)):
+                correlation_id = (
+                    re.sub(r"[^A-Za-z0-9._:-]", "_", str(raw_id))[:64] or uuid.uuid4().hex
+                )
+            method = payload.get("method")
+            if method in {"message/send", "message/stream"}:
+                capability = method
+        return RequestObservability(
+            correlation_id=correlation_id,
+            capability=capability,
+            started_at=time.perf_counter(),
+        )
 
 
 def build_card() -> AgentCard:
@@ -167,11 +238,19 @@ def build_card() -> AgentCard:
         default_output_modes=["text/plain"],
         skills=[
             AgentSkill(
-                id="chat",
-                name="General chat",
-                description="Greets the user, explains what it can do, and replies to any message.",
-                tags=["chat", "echo"],
-                examples=["Hello", "What can you do?"],
+                id="liftline-dispatch",
+                name="LiftLine dispatch evaluation",
+                description=(
+                    "Evaluates fictional LiftLine delivery capacity, handling, arrival slots, "
+                    "and EUR quotes for the Zava demo. Advisory only; does not book or approve."
+                ),
+                tags=["delivery", "dispatch", "quote", "synthetic-data"],
+                examples=[
+                    "Evaluate 60 bags of MORTAR-20 from ZAVA-DEPOT to Riverside renovation site "
+                    "on 2030-07-14 in Europe/Amsterdam, before 10:00. No forklift is available; "
+                    "use baseline handling assumptions.",
+                    "What details do you need to evaluate this delivery?",
+                ],
             )
         ],
     )

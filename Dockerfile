@@ -14,7 +14,8 @@ RUN uv export --frozen --no-dev --no-emit-project --no-header -o /tmp/requiremen
     && uv pip install --system --no-cache --require-hashes -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
-COPY main.py ./
+COPY main.py liftline.py ./
+COPY liftline-dispatch/ ./liftline-dispatch/
 
 RUN useradd --create-home --uid 10001 app
 USER app

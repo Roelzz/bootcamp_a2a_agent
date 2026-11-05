@@ -1,11 +1,12 @@
 [project]
 name = "a2a-server-bootcamp"
 version = "0.1.0"
-description = "Generic conversational A2A server for Copilot Studio labs"
+description = "LLM-backed synthetic LiftLine dispatch advisor over A2A"
 requires-python = ">=3.12"
 dependencies = [
     "a2a-sdk[http-server]>=0.3.26,<0.4",
     "loguru>=0.7.3",
+    "openai>=2.0.0",
     "python-dotenv>=1.2.4",
     "uvicorn>=0.54.0",
 ]

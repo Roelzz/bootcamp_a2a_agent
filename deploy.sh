@@ -7,6 +7,9 @@ if [ -f .env ]; then
     . ./.env
     set +a
 fi
+# The local model credential is not a deploy-script input. Configure it as an
+# Azure Container App secret and map AZURE_AI_API_KEY to that secret reference.
+unset AZURE_AI_API_KEY
 
 : "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID in .env or the environment}"
 RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-rg-a2a-server-bootcamp}"
@@ -28,6 +31,8 @@ env_vars=("LOG_LEVEL=${LOG_LEVEL:-INFO}")
 if [ -n "${AGENT_NAME:-}" ]; then env_vars+=("AGENT_NAME=$AGENT_NAME"); fi
 if [ -n "${AGENT_DESCRIPTION:-}" ]; then env_vars+=("AGENT_DESCRIPTION=$AGENT_DESCRIPTION"); fi
 if [ -n "${PUBLIC_BASE_URL:-}" ]; then env_vars+=("PUBLIC_BASE_URL=$PUBLIC_BASE_URL"); fi
+if [ -n "${AZURE_AI_ENDPOINT:-}" ]; then env_vars+=("AZURE_AI_ENDPOINT=$AZURE_AI_ENDPOINT"); fi
+if [ -n "${AZURE_AI_MODEL:-}" ]; then env_vars+=("AZURE_AI_MODEL=$AZURE_AI_MODEL"); fi
 
 echo "==> Build and deploy $APP_NAME to $RESOURCE_GROUP ($LOCATION)"
 az containerapp up \
