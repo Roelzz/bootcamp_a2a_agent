@@ -180,7 +180,13 @@ def build_card() -> AgentCard:
 def build_app() -> Starlette:
     handler = DefaultRequestHandler(agent_executor=ChatExecutor(), task_store=InMemoryTaskStore())
     application = A2AStarletteApplication(agent_card=build_card(), http_handler=handler)
-    return application.build(middleware=[Middleware(RequestLogMiddleware)])
+    app = application.build(middleware=[Middleware(RequestLogMiddleware)])
+    # Some Copilot Studio connections send JSON-RPC to the discovery URL.
+    for path in ("/.well-known/agent-card.json", "/.well-known/agent.json"):
+        app.routes.extend(
+            route for route in application.routes(rpc_url=path) if route.methods == {"POST"}
+        )
+    return app
 
 
 def main() -> None:

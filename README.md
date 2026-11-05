@@ -6,6 +6,7 @@ Generic conversational agent exposed over [A2A](https://a2a-protocol.org) (proto
 |---|---|
 | `GET /.well-known/agent-card.json` | Agent card (legacy `/.well-known/agent.json` also served) |
 | `POST /` | JSON-RPC: `message/send`, `message/stream` |
+| `POST /.well-known/agent-card.json` or `POST /.well-known/agent.json` | Same JSON-RPC handler, for connections that send messages to the discovery URL |
 
 ## Run locally
 
@@ -45,6 +46,10 @@ Logs: `az containerapp logs show -n a2a-server-bootcamp -g rg-a2a-server-bootcam
 2. Agent card URL: `https://<fqdn>/.well-known/agent-card.json` (name and description fill in automatically).
 3. Authentication: **None**, then **Create connection** and **Add**.
 4. Test in the Preview pane: "Hello", "What can you do?", then a few follow-up messages.
+
+The card advertises the root URL as the message endpoint. Some Copilot Studio connections
+instead POST to the discovery URL; both card paths also accept JSON-RPC directly, without
+a redirect. GET on either path still returns the agent card.
 
 ## Configuration
 

@@ -10,6 +10,7 @@ from starlette.testclient import TestClient
 import main
 
 CHAT_HISTORY_KEY = "copilotstudio.microsoft.com/a2a/chathistory"
+RPC_PATHS = ("/", "/.well-known/agent-card.json", "/.well-known/agent.json")
 
 
 def new_context() -> str:
@@ -91,9 +92,16 @@ def test_agent_card(http: httpx.Client, path: str) -> None:
     assert card["skills"]
 
 
-def test_message_send_replies_with_agent_message(http: httpx.Client) -> None:
+@pytest.mark.parametrize("path", RPC_PATHS)
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("ping", 'You said: "ping"'), ("Hello, What can you do?", "generic A2A test agent")],
+)
+def test_message_send_replies_with_agent_message(
+    http: httpx.Client, path: str, text: str, expected: str
+) -> None:
     context_id = new_context()
-    response = http.post("/", json=copilot_studio_request("message/send", "ping", context_id))
+    response = http.post(path, json=copilot_studio_request("message/send", text, context_id))
     assert response.status_code == 200
     body = response.json()
     assert "error" not in body
@@ -101,13 +109,14 @@ def test_message_send_replies_with_agent_message(http: httpx.Client) -> None:
     assert result["kind"] == "message"
     assert result["role"] == "agent"
     assert result["contextId"] == context_id
-    assert 'You said: "ping"' in reply_text(result)
+    assert expected in reply_text(result)
 
 
-def test_message_stream_ends_with_agent_message(http: httpx.Client) -> None:
+@pytest.mark.parametrize("path", RPC_PATHS)
+def test_message_stream_ends_with_agent_message(http: httpx.Client, path: str) -> None:
     context_id = new_context()
     request = copilot_studio_request("message/stream", "ping", context_id)
-    with http.stream("POST", "/", json=request) as response:
+    with http.stream("POST", path, json=request) as response:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
         events = sse_events(response.iter_lines())
@@ -122,13 +131,22 @@ def test_message_stream_ends_with_agent_message(http: httpx.Client) -> None:
 def test_context_is_remembered_per_conversation(http: httpx.Client) -> None:
     context_id = new_context()
     first = http.post("/", json=copilot_studio_request("message/send", "ping", context_id))
-    second = http.post("/", json=copilot_studio_request("message/send", "pong", context_id))
+    second = http.post(
+        "/.well-known/agent-card.json",
+        json=copilot_studio_request("message/send", "pong", context_id),
+    )
+    third = http.post(
+        "/.well-known/agent.json",
+        json=copilot_studio_request("message/send", "again", context_id),
+    )
     other = http.post("/", json=copilot_studio_request("message/send", "ping", new_context()))
     assert "remember 1 message from" in reply_text(first.json()["result"])
     assert "remember 2 messages from" in reply_text(second.json()["result"])
+    assert "remember 3 messages from" in reply_text(third.json()["result"])
     assert "remember 1 message from" in reply_text(other.json()["result"])
 
 
+@pytest.mark.parametrize("path", RPC_PATHS)
 @pytest.mark.parametrize(
     ("body", "code"),
     [
@@ -137,8 +155,10 @@ def test_context_is_remembered_per_conversation(http: httpx.Client) -> None:
         (b'{"jsonrpc": "2.0", "id": 1, "method": "nope/nope", "params": {}}', -32601),
     ],
 )
-def test_bad_requests_return_jsonrpc_error(http: httpx.Client, body: bytes, code: int) -> None:
-    response = http.post("/", content=body, headers={"content-type": "application/json"})
+def test_bad_requests_return_jsonrpc_error(
+    http: httpx.Client, path: str, body: bytes, code: int
+) -> None:
+    response = http.post(path, content=body, headers={"content-type": "application/json"})
     assert response.status_code == 200
     assert response.json()["error"]["code"] == code
 
